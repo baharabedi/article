@@ -1,0 +1,167 @@
+import os
+print(os.getcwd())
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_auc_score
+from sklearn.decomposition import TruncatedSVD
+from imblearn.over_sampling import SMOTE
+from sklearn.tree import DecisionTreeClassifier, export_text, plot_tree
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# Function to calculate rule proportions
+def calculate_rule_proportions(tree_model, feature_names, X_data):
+    tree_rules = export_text(tree_model, feature_names=feature_names)
+    print("\nExtracted Rules from Decision Tree:")
+    print(tree_rules)
+
+    # Parse the rules into conditions
+    def parse_conditions(tree, feature_names):
+        conditions = []
+
+        def traverse(node, path):
+            if tree.feature[node] != -2:  # Non-leaf node
+                feature = feature_names[tree.feature[node]]
+                threshold = tree.threshold[node]
+                left_path = path + [(feature, "<=", threshold)]
+                right_path = path + [(feature, ">", threshold)]
+
+                traverse(tree.children_left[node], left_path)
+                traverse(tree.children_right[node], right_path)
+            else:
+                conditions.append(path)
+
+        traverse(0, [])
+        return conditions
+
+    # Extract conditions from the decision tree
+    conditions = parse_conditions(tree_model.tree_, feature_names)
+
+    # Calculate proportions for each rule
+    rule_proportions = []
+    for condition in conditions:
+        mask = np.ones(X_data.shape[0], dtype=bool)
+        for feature, operator, threshold in condition:
+            if operator == "<=":
+                mask &= X_data[feature] <= threshold
+            elif operator == ">":
+                mask &= X_data[feature] > threshold
+        rule_proportion = mask.mean()
+        rule_proportions.append((condition, rule_proportion))
+
+    return rule_proportions
+
+# Reading data
+file_path = r"D:\\Academic\\subject\\data\\data final\\final data- statistic\\معیار کیفیت دو سطحی1403.10.05.xlsx"
+df = pd.read_excel(file_path)
+
+# Splitting features (X) and target variable (Y)
+X = df.drop('UNACC', axis=1)
+y = df['UNACC']
+
+# Initial class distribution
+print("Class Distribution before SMOTE:")
+print(y.value_counts())
+
+# Dimensionality reduction using LoRa (Truncated SVD)
+svd = TruncatedSVD(n_components=min(10, X.shape[1]), random_state=42)
+X_reduced = svd.fit_transform(X)
+
+# Balancing data with SMOTE
+smote = SMOTE(random_state=42)
+X_resampled, y_resampled = smote.fit_resample(X_reduced, y)
+
+# Class distribution after SMOTE
+print("\nClass Distribution after SMOTE:")
+unique, counts = np.unique(y_resampled, return_counts=True)
+print(dict(zip(unique, counts)))
+
+# Splitting data into train and test sets
+X_train, X_test, y_train, y_test = train_test_split(
+    X_resampled, y_resampled, test_size=0.2, random_state=42, stratify=y_resampled
+)
+
+# Finding the best depth for pruning the decision tree
+max_depths = range(1, 21)  # Test depths from 1 to 20
+cv_scores = []
+
+for depth in max_depths:
+    model = DecisionTreeClassifier(criterion='entropy', max_depth=depth, random_state=42)
+    scores = cross_val_score(model, X_train, y_train, cv=5, scoring='accuracy')
+    cv_scores.append(np.mean(scores))
+
+# Choosing the best depth
+best_depth = max_depths[np.argmax(cv_scores)]
+print(f"Best max_depth: {best_depth}")
+
+# Training the model with the best depth
+model = DecisionTreeClassifier(criterion='entropy', max_depth=best_depth, random_state=42)
+model.fit(X_train, y_train)
+
+# Predicting and evaluating the model
+y_pred = model.predict(X_test)
+
+print("\nConfusion Matrix:")
+cm = confusion_matrix(y_test, y_pred)
+print(cm)
+
+print("\nClassification Report:")
+cr = classification_report(y_test, y_pred)
+print(cr)
+
+accuracy = accuracy_score(y_test, y_pred)
+print(f"Accuracy: {accuracy * 100:.2f}%")
+
+# Calculating AUC-ROC
+y_pred_prob = model.predict_proba(X_test)[:, 1]
+roc_auc = roc_auc_score(y_test, y_pred_prob)
+print(f"AUC-ROC: {roc_auc:.2f}")
+
+# Feature importances
+if hasattr(model, 'feature_importances_'):
+    feature_importances = model.feature_importances_
+    feature_names = X.columns[:len(feature_importances)]
+    plt.figure(figsize=(10, 6))
+    sns.barplot(x=feature_importances, y=feature_names)
+    plt.title("Feature Importances")
+    plt.xlabel("Importance")
+    plt.ylabel("Features")
+    plt.tight_layout()
+    plt.savefig("optimized_decision_tree_output/feature_importances.png")
+    plt.show()
+
+# Plotting the decision tree
+plt.figure(figsize=(20, 10))
+plot_tree(model, feature_names=feature_names, class_names=['Class 0', 'Class 1'], filled=True)
+plt.title("Decision Tree")
+plt.tight_layout()
+plt.savefig("optimized_decision_tree_output/decision_tree_graph.png")
+plt.show()
+
+# Confusion matrix visualization
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=['Class 0', 'Class 1'], yticklabels=['Class 0', 'Class 1'])
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.savefig("optimized_decision_tree_output/confusion_matrix.png")
+plt.show()
+
+# Calculating and saving rule proportions
+rule_proportions = calculate_rule_proportions(model, feature_names, pd.DataFrame(X_reduced, columns=feature_names))
+
+output_dir = "optimized_decision_tree_output"
+os.makedirs(output_dir, exist_ok=True)
+
+rules_output_file = os.path.join(output_dir, "rule_proportions.txt")
+with open(rules_output_file, "w", encoding="utf-8") as f:
+    for i, (rule, proportion) in enumerate(rule_proportions):
+        f.write(f"Rule {i + 1}:\n")
+        for feature, operator, threshold in rule:
+            f.write(f"  {feature} {operator} {threshold}\n")
+        f.write(f"Proportion: {proportion:.4f}\n\n")
+
+print(f"Rule proportions saved to {rules_output_file}")
