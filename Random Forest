@@ -1,0 +1,99 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, roc_auc_score
+from sklearn.decomposition import TruncatedSVD
+from imblearn.over_sampling import SMOTE
+from sklearn.ensemble import RandomForestClassifier
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# خواندن داده‌ها
+file_path = r"D:\\Academic\\subject\\data\\data final\\final data- statistic\\معیار کیفیت دو سطحی1403.10.05.xlsx"
+df = pd.read_excel(file_path)
+
+# جدا کردن ویژگی‌ها (X) و متغیر هدف (Y)
+X = df.drop('UNACC', axis=1)
+y = df['UNACC']
+
+# بررسی اولیه تعداد داده‌های هر کلاس
+print("Class Distribution before SMOTE:")
+print(y.value_counts())
+
+# کاهش ابعاد داده‌ها با استفاده از LoRa (Truncated SVD)
+svd = TruncatedSVD(n_components=min(10, X.shape[1]), random_state=42)
+X_reduced = svd.fit_transform(X)
+
+# متوازن‌سازی داده‌ها با SMOTE
+smote = SMOTE(random_state=42)
+X_resampled, y_resampled = smote.fit_resample(X_reduced, y)
+
+# بررسی تعداد داده‌های هر کلاس پس از SMOTE
+print("\nClass Distribution after SMOTE:")
+unique, counts = np.unique(y_resampled, return_counts=True)
+print(dict(zip(unique, counts)))
+
+# تقسیم داده‌ها به مجموعه آموزش و آزمایش
+X_train, X_test, y_train, y_test = train_test_split(
+    X_resampled, y_resampled, test_size=0.2, random_state=42, stratify=y_resampled
+)
+
+# ایجاد مدل جنگل تصادفی
+model = RandomForestClassifier(n_estimators=100, random_state=42)
+model.fit(X_train, y_train)
+
+# پیش‌بینی و ارزیابی مدل
+y_pred = model.predict(X_test)
+
+print("\nConfusion Matrix:")
+cm = confusion_matrix(y_test, y_pred)
+print(cm)
+
+print("\nClassification Report:")
+cr = classification_report(y_test, y_pred)
+print(cr)
+
+accuracy = accuracy_score(y_test, y_pred)
+print(f"Accuracy: {accuracy * 100:.2f}%")
+
+# محاسبه AUC-ROC
+y_pred_prob = model.predict_proba(X_test)[:, 1]
+roc_auc = roc_auc_score(y_test, y_pred_prob)
+print(f"AUC-ROC: {roc_auc:.2f}")
+
+# نمایش اهمیت ویژگی‌ها
+if hasattr(model, 'feature_importances_'):
+    feature_importances = model.feature_importances_
+    feature_names = X.columns[:len(feature_importances)]
+    output_dir = r"D:\\Academic\\output\\optimized_random_forest_output"
+    os.makedirs(output_dir, exist_ok=True)
+
+    plt.figure(figsize=(10, 6))
+    sns.barplot(x=feature_importances, y=feature_names)
+    plt.title("Feature Importances")
+    plt.xlabel("Importance")
+    plt.ylabel("Features")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "feature_importances.png"))
+    plt.show()
+
+# رسم ماتریس سردرگمی
+plt.figure(figsize=(8, 6))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=['Class 0', 'Class 1'], yticklabels=['Class 0', 'Class 1'])
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "confusion_matrix.png"))
+plt.show()
+
+# ذخیره خروجی‌ها
+output_file_path = os.path.join(output_dir, "random_forest_with_lora_smote.txt")
+with open(output_file_path, "w", encoding="utf-8") as f:
+    f.write("Confusion Matrix:\n")
+    f.write(str(cm) + "\n\n")
+    f.write("Classification Report:\n")
+    f.write(cr + "\n")
+    f.write(f"Accuracy: {accuracy * 100:.2f}%\n")
+    f.write(f"AUC-ROC: {roc_auc:.2f}\n")
