@@ -1,0 +1,297 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import tempfile
+import warnings
+import logging
+from scipy.stats import mstats
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, GridSearchCV
+from sklearn.metrics import (
+    classification_report, confusion_matrix, roc_auc_score,
+    precision_recall_curve, f1_score, recall_score, auc, make_scorer,
+    precision_score, roc_curve
+)
+from sklearn.preprocessing import RobustScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import RFECV
+from sklearn.calibration import CalibratedClassifierCV
+from imblearn.pipeline import Pipeline as ImbPipeline
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+
+from lightgbm import LGBMClassifier, early_stopping
+from catboost import CatBoostClassifier
+import shap
+
+## --- Section 0: Initial Setup ---
+logging.basicConfig(filename='model_training.log', level=logging.ERROR,
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+plt.rcParams['font.family'] = 'DejaVu Sans'
+temp_dir = tempfile.mkdtemp()
+os.environ["CATBOOST_TEMP_DIR"] = temp_dir
+
+## --- Section 1: Load and Prepare Data ---
+try:
+    file_path = "thesis dataset new.xlsx" # Assumes file is uploaded to Colab session
+    df = pd.read_excel(file_path)
+    print("✅ Dataset loaded successfully.")
+except FileNotFoundError:
+    error_msg = "Dataset file not found. Please upload the file to your Colab session and update the path."
+    logging.error(error_msg)
+    print(f"❌ ERROR: {error_msg}")
+    exit()
+
+output_dir = "model_outputs_final_article_plots_v3"
+os.makedirs(output_dir, exist_ok=True)
+df = df.dropna()
+TARGET = 'UNACC'
+
+## --- Section 2: Advanced Feature Engineering ---
+main_features_list = ['CON', 'UNCON', 'EP', 'PV', 'AQ', 'EL', 'SIZE', 'INST', 'LEV', 'IC']
+
+for col in ['CON', 'UNCON', 'EL', 'LEV', 'SIZE', 'EP', 'AQ', 'PV']:
+    if df[col].min() <= 0:
+        df[col] = df[col] - df[col].min() + 1e-6
+    df[col] = np.log1p(df[col])
+    df[col] = mstats.winsorize(df[col], limits=[0.05, 0.05])
+
+print("Applying Target Encoding for 'BC' feature...")
+bc_target_map = df.groupby('BC')[TARGET].mean()
+df['BC_target_encoded'] = df['BC'].map(bc_target_map)
+df = df.drop('BC', axis=1)
+main_features_list.append('BC_target_encoded')
+
+X_pre_scaling = df.drop(TARGET, axis=1).select_dtypes(include=np.number).copy()
+y = df[TARGET]
+
+X_pre_scaling['CON_EP_interaction'] = X_pre_scaling['CON'] * X_pre_scaling['EP']
+X_pre_scaling['IC_CON_interaction'] = X_pre_scaling['IC'] * X_pre_scaling['CON']
+X_pre_scaling['SIZE_LEV_interaction'] = X_pre_scaling['SIZE'] * X_pre_scaling['LEV']
+X_pre_scaling['INST_IC_interaction'] = X_pre_scaling['INST'] * X_pre_scaling['IC']
+epsilon = 1e-6
+X_pre_scaling['CON_div_SIZE'] = X_pre_scaling['CON'] / (X_pre_scaling['SIZE'] + epsilon)
+X_pre_scaling['LEV_div_SIZE'] = X_pre_scaling['LEV'] / (X_pre_scaling['SIZE'] + epsilon)
+X_pre_scaling['INST_div_SIZE'] = X_pre_scaling['INST'] / (X_pre_scaling['SIZE'] + epsilon)
+X_pre_scaling['EP_div_AQ'] = X_pre_scaling['EP'] / (X_pre_scaling['AQ'] + epsilon)
+X_pre_scaling['CON_div_UNCON'] = X_pre_scaling['CON'] / (X_pre_scaling['UNCON'] + epsilon)
+X_pre_scaling['PV_div_AQ'] = X_pre_scaling['PV'] / (X_pre_scaling['AQ'] + epsilon)
+X_pre_scaling.replace([np.inf, -np.inf], np.nan, inplace=True)
+X_pre_scaling.fillna(0, inplace=True)
+print("✅ Advanced feature engineering complete.")
+
+print("📊 Generating correlation plot for main features against the target...")
+main_df_corr = pd.concat([X_pre_scaling[main_features_list], y], axis=1)
+plt.figure(figsize=(12, 8))
+main_df_corr.corr()[TARGET].drop(TARGET).sort_values(ascending=False).plot(kind='bar', color='skyblue')
+plt.title(f'Correlation of Main Features with Target ({TARGET})', fontsize=16)
+plt.ylabel('Correlation Coefficient')
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y', linestyle='--')
+plt.tight_layout()
+plt.savefig(os.path.join(output_dir, "main_features_correlation.png"), dpi=300)
+plt.close()
+
+## --- Section 3: Scale Features ---
+scaler = RobustScaler()
+X_scaled = scaler.fit_transform(X_pre_scaling)
+X = pd.DataFrame(X_scaled, columns=X_pre_scaling.columns)
+print("✅ Features scaled using RobustScaler.")
+
+## --- Section 4: Split Data ---
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+## --- Section 5: Feature Selection with RFECV ---
+print("🚀 Starting feature selection with RFECV on new features...")
+rfe_estimator = LGBMClassifier(random_state=42, verbose=-1)
+rfecv = RFECV(
+    estimator=rfe_estimator, step=1, cv=StratifiedKFold(3),
+    scoring='roc_auc', min_features_to_select=10, n_jobs=-1
+)
+rfecv.fit(X_train, y_train)
+selected_features = X_train.columns[rfecv.support_].tolist()
+print(f"✅ RFECV selected {len(selected_features)} optimal features:\n", selected_features)
+X_train_selected = X_train[selected_features]
+X_test_selected = X_test[selected_features]
+
+## --- Section 6: Resampling Pipeline ---
+resampling_pipeline = ImbPipeline([
+    ('smote', SMOTE(sampling_strategy=0.5, random_state=42)),
+    ('under', RandomUnderSampler(sampling_strategy=1.0, random_state=42))
+])
+X_train_resampled, y_train_resampled = resampling_pipeline.fit_resample(X_train_selected, y_train)
+print("Class distribution after resampling:\n", y_train_resampled.value_counts())
+
+## --- Section 7: Custom Scorer ---
+def combined_score(y_true, y_pred):
+    recall = recall_score(y_true, y_pred, pos_label=1, zero_division=0)
+    f1 = f1_score(y_true, y_pred, pos_label=1, zero_division=0)
+    return 0.60 * recall + 0.40 * f1
+combined_scorer = make_scorer(combined_score, greater_is_better=True)
+
+## --- Section 8: Models and Grids ---
+models = {
+    'LightGBM': {
+        'base_model': LGBMClassifier(n_estimators=2000, random_state=42, verbose=-1),
+        'params': { 'learning_rate': [0.01, 0.05], 'max_depth': [7, 10], 'reg_lambda': [0.1, 1.0], 'num_leaves': [20, 31, 40] }
+    },
+    'CatBoost': {
+        'base_model': CatBoostClassifier(random_state=42, verbose=0),
+         'params': { 'learning_rate': [0.01, 0.05], 'depth': [6, 8], 'l2_leaf_reg': [1, 3], 'iterations': [1000, 2000] }
+    },
+    'RandomForest': {
+        'base_model': RandomForestClassifier(random_state=42),
+        'params': { 'n_estimators': [300, 500], 'max_depth': [10, None], 'min_samples_leaf': [2, 4], 'criterion': ['entropy'] }
+    }
+}
+
+## --- Section 9: Train, Calibrate, Evaluate, and Explain ---
+best_models = {}
+all_results = []
+X_train_split, X_val_split, y_train_split, y_val_split = train_test_split(
+    X_train_resampled, y_train_resampled, test_size=0.2, random_state=42, stratify=y_train_resampled)
+
+for name, config in models.items():
+    try:
+        print(f"\n--- 🚀 Training and evaluating {name} ---")
+        grid_search = GridSearchCV(
+            config['base_model'], config['params'],
+            cv=StratifiedKFold(n_splits=3, shuffle=True, random_state=42),
+            scoring=combined_scorer, n_jobs=-1, verbose=0
+        )
+        fit_params = {}
+        # Use early stopping only for models that support it
+        if name in ['LightGBM', 'CatBoost']:
+            fit_params['eval_set'] = [(X_val_split, y_val_split)]
+            if name == 'LightGBM':
+                fit_params['callbacks'] = [early_stopping(100, verbose=False)]
+            elif name == 'CatBoost':
+                grid_search.estimator.set_params(early_stopping_rounds=100)
+
+        # Fit all models. RandomForest will ignore the unused fit_params.
+        grid_search.fit(X_train_split, y_train_split, **fit_params)
+
+        best_raw_model = grid_search.best_estimator_
+        print(f"Best parameters found: {grid_search.best_params_}")
+
+        print("Calibrating model probabilities...")
+        calibrated_model = CalibratedClassifierCV(best_raw_model, method='isotonic', cv=3, n_jobs=-1)
+        calibrated_model.fit(X_train_resampled, y_train_resampled)
+        best_models[name] = calibrated_model
+
+        y_pred_prob = calibrated_model.predict_proba(X_test_selected)[:, 1]
+        thresholds = np.arange(0.1, 0.91, 0.05)
+        scores = [combined_score(y_test, (y_pred_prob >= t).astype(int)) for t in thresholds]
+        optimal_threshold = thresholds[np.argmax(scores)]
+        y_pred = (y_pred_prob >= optimal_threshold).astype(int)
+        print(f"Optimal threshold found: {optimal_threshold:.2f}")
+
+        cm = confusion_matrix(y_test, y_pred)
+        precision, recall, _ = precision_recall_curve(y_test, y_pred_prob)
+        results = {'Model': name, 'Accuracy': (y_test == y_pred).mean(), 'Recall (Class 1)': recall_score(y_test, y_pred, pos_label=1), 'F1-Score (Class 1)': f1_score(y_test, y_pred, pos_label=1), 'Precision (Class 1)': precision_score(y_test, y_pred, pos_label=1, zero_division=0), 'PR-AUC': auc(recall, precision), 'ROC-AUC': roc_auc_score(y_test, y_pred_prob), 'False Negatives': cm[1, 0]}
+        all_results.append(results)
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred, target_names=['Responsive (0)', 'Non-responsive (1)']))
+
+        # --- Confusion Matrix Plot ---
+        model_output_dir = os.path.join(output_dir, name)
+        os.makedirs(model_output_dir, exist_ok=True)
+        plt.figure(figsize=(8, 6))
+        sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
+                    xticklabels=['Predicted Responsive', 'Predicted Non-responsive'],
+                    yticklabels=['Actual Responsive', 'Actual Non-responsive'])
+        plt.title(f'Confusion Matrix - {name}', fontsize=16)
+        plt.ylabel('Actual Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+        plt.savefig(os.path.join(model_output_dir, f"confusion_matrix_{name}.png"), dpi=300)
+        plt.close()
+        print(f"✅ Saved confusion matrix plot for {name}.")
+
+        # --- SHAP Analysis for Each Model ---
+        print(f"🔬 Performing SHAP analysis for {name}...")
+        explainer = shap.TreeExplainer(best_raw_model)
+        shap_values = explainer.shap_values(X_test_selected)
+
+        # Handle SHAP values based on model type
+        if name == 'RandomForest':
+            # RandomForest SHAP values are [samples, features, classes]
+            shap_values_class1 = shap_values[:, :, 1]  # Select class 1
+            base_value = explainer.expected_value[1] if isinstance(explainer.expected_value, list) else explainer.expected_value
+        else:
+            # LightGBM and CatBoost return [class0, class1] or single array
+            shap_values_class1 = shap_values[1] if isinstance(shap_values, list) else shap_values
+            base_value = explainer.expected_value[1] if isinstance(explainer.expected_value, list) else explainer.expected_value
+
+        shap_df = pd.DataFrame(shap_values_class1, columns=selected_features)
+        main_features_in_model = [f for f in main_features_list if f in selected_features]
+
+        # Generate SHAP summary plot (global feature importance)
+        if main_features_in_model:
+            shap_values_main = shap_df[main_features_in_model].values
+            X_test_main = X_test_selected[main_features_in_model]
+            plt.figure()
+            shap.summary_plot(shap_values_main, X_test_main, plot_type="bar", show=False)
+            plt.title(f'SHAP Global Importance (Main Variables) - {name}', fontsize=12)
+            plt.tight_layout()
+            plt.savefig(os.path.join(model_output_dir, f"shap_global_bar_main_vars_{name}.png"), dpi=300)
+            plt.close()
+
+        # Generate SHAP waterfall plot (local explanation)
+        shap_explanation = shap.Explanation(
+            values=shap_values_class1[0],
+            base_values=base_value,
+            data=X_test_selected.iloc[0],
+            feature_names=X_test_selected.columns
+        )
+        plt.figure()
+        shap.waterfall_plot(shap_explanation, show=False, max_display=15)
+        plt.title(f'SHAP Local Explanation (Waterfall) - {name} - Sample 0', fontsize=12)
+        plt.tight_layout()
+        plt.savefig(os.path.join(model_output_dir, f"shap_local_waterfall_{name}_sample0.png"), dpi=300)
+        plt.close()
+        print(f"✅ Saved SHAP plots for {name}.")
+
+    except Exception as e:
+        print(f"❌ ERROR during {name} training: {e}")
+        continue
+
+## --- Section 10: Final Results Summary and Plots ---
+if all_results:
+    results_df = pd.DataFrame(all_results)
+    results_df_sorted = results_df.sort_values(by='F1-Score (Class 1)', ascending=False)
+    print("\n\n--- 📊 Final Model Performance Summary ---")
+    print(results_df_sorted.to_string(index=False))
+    results_df_sorted.to_csv(os.path.join(output_dir, "model_performance_summary.csv"), index=False)
+    print(f"\n✅ Final summary saved to '{output_dir}/model_performance_summary.csv'")
+
+    print("📊 Generating combined ROC curve plot...")
+    plt.figure(figsize=(10, 8))
+    for name, model in best_models.items():
+        if name in results_df['Model'].values:
+            y_pred_prob = model.predict_proba(X_test_selected)[:, 1]
+            fpr, tpr, _ = roc_curve(y_test, y_pred_prob)
+            roc_auc = results_df.loc[results_df['Model'] == name, 'ROC-AUC'].iloc[0]
+            plt.plot(fpr, tpr, label=f'{name} (AUC = {roc_auc:.2f})')
+
+    plt.plot([0, 1], [0, 1], 'k--', label='Random Chance')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curves')
+    plt.legend(loc="lower right")
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, "combined_roc_curve.png"), dpi=300)
+    plt.close()
+    print("✅ Combined ROC curve plot saved.")
+else:
+    print("\nNo models were successfully trained.")
+
+print("\n--- Script finished! ---")
